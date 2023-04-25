@@ -2,8 +2,6 @@ import os
 import numpy as np
 import matplotlib.pyplot as plt
 from PIL import Image
-import pybullet_envs
-import pybullet as p
 import gym
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv
@@ -12,9 +10,11 @@ import torch
 from torch import nn
 from torch.cuda.amp import autocast
 import cv2
-import time
+import time, sys
 from stable_baselines3.common.callbacks import BaseCallback
-from gym3 import ViewerWrapper, ToGymEnv
+from stable_baselines3.common.monitor import Monitor
+from stable_baselines3.common.results_plotter import load_results, ts2xy
+from stable_baselines3.common import results_plotter
 
 
 class CustomResolutionWrapper(gym.ObservationWrapper):
@@ -29,17 +29,61 @@ class CustomResolutionWrapper(gym.ObservationWrapper):
             img_normed = img_resized.astype(np.float32)
             return img_normed
         
-        print(obs.shape, np.min(obs), np.max(obs), obs.dtype)
+        #print(obs.shape, np.min(obs), np.max(obs), obs.dtype)
 
-        processed_images = np.apply_along_axis(process_image, 1, obs)
+        # Remove np.apply_along_axis
+        processed_image = process_image(obs)
 
-        print(processed_images.shape)
+        #print(processed_image.shape)
 
-        return processed_images
+        return processed_image
 
 
-class NoRenderCallback(BaseCallback):
+class SaveOnBestTrainingRewardCallback(BaseCallback):
+    """
+    Callback for saving a model (the check is done every ``check_freq`` steps)
+    based on the training reward (in practice, we recommend using ``EvalCallback``).
+
+    :param check_freq: (int)
+    :param log_dir: (str) Path to the folder where the model will be saved.
+      It must contains the file created by the ``Monitor`` wrapper.
+    :param verbose: (int)
+    """
+
+    def __init__(self, check_freq: int, log_dir: str, verbose=1):
+        super().__init__(verbose)
+        self.check_freq = check_freq
+        self.log_dir = log_dir
+        self.save_path = os.path.join(log_dir, f"best_model_PPO_{sys.argv[1]}_{sys.argv[3]}_{time.time()}.pth")
+        self.best_mean_reward = -np.inf
+
+    def _init_callback(self) -> None:
+        # Create folder if needed
+        if self.save_path is not None:
+            os.makedirs(self.save_path, exist_ok=True)
+
     def _on_step(self) -> bool:
+        if self.n_calls % self.check_freq == 0:
+
+            # Retrieve training reward
+            x, y = ts2xy(load_results(self.log_dir), "timesteps")
+            if len(x) > 0:
+                # Mean training reward over the last 100 episodes
+                mean_reward = np.mean(y[-100:])
+                if self.verbose > 0:
+                    print(f"Num timesteps: {self.num_timesteps}")
+                    print(
+                        f"Best mean reward: {self.best_mean_reward:.2f} - Last mean reward per episode: {mean_reward:.2f}"
+                    )
+
+                # New best model, you could save the agent here
+                if mean_reward > self.best_mean_reward:
+                    self.best_mean_reward = mean_reward
+                    # Example for saving best model
+                    if self.verbose > 0:
+                        print(f"Saving new best model to {self.save_path}.zip")
+                    self.model.save(self.save_path)
+
         return True
 
 
@@ -85,15 +129,50 @@ class HF_ViT(nn.Module):
         return outputs.last_hidden_state[:, 0].squeeze()
 
 
+def moving_average(values, window):
+    """
+    Smooth values by doing a moving average
+    :param values: (numpy array)
+    :param window: (int)
+    :return: (numpy array)
+    """
+    weights = np.repeat(1.0, window) / window
+    return np.convolve(values, weights, "valid")
+
+
+def plot_results(log_folder, title="Learning Curve"):
+    """
+    plot the results
+
+    :param log_folder: (str) the save location of the results to plot
+    :param title: (str) the title of the task to plot
+    """
+    x, y = ts2xy(load_results(log_folder), "timesteps")
+    y = moving_average(y, window=50)
+    # Truncate x
+    x = x[len(x) - len(y) :]
+
+    fig = plt.figure(title)
+    plt.plot(x, y)
+    plt.xlabel("Number of Timesteps")
+    plt.ylabel("Rewards")
+    plt.title(title + " Smoothed")
+    plt.show()
+    plt.savefig(f"PPO_{sys.argv[1]}_{sys.argv[2]}_{sys.argv[3]}_{time.time()}.png".replace("/", "_"))
+
+
 def run_training():
-    env_name = "CarRacing-v0"
+    env_name = sys.argv[1]
     env = gym.make(env_name)
     env = CustomResolutionWrapper(env, resolution=(224, 224))
-    env = DummyVecEnv([lambda: env])
+    #env = DummyVecEnv([lambda: env])
+
+    log_dir = "logs"
+    env = Monitor(env, log_dir, filename=f"monitor_{time.time()}")
 
     device = torch.device("cuda:0")
 
-    pretrained_model_name = "google/vit-base-patch16-224"
+    pretrained_model_name = sys.argv[2]
 
     policy_kwargs = dict(
         net_arch=[
@@ -106,18 +185,22 @@ def run_training():
         features_extractor_kwargs=dict(pretrained_model_name=pretrained_model_name, device=device),
     )
 
-    callback = NoRenderCallback()
-    model = PPO("MlpPolicy", env, policy_kwargs=policy_kwargs, verbose=1, device="cuda:0")
-    model.learn(total_timesteps=2048, progress_bar=True, callback=callback)
+    callback = SaveOnBestTrainingRewardCallback(check_freq=1000, log_dir=log_dir)
 
-    rewards = model.episode_reward_history
-    plt.plot(rewards)
-    plt.xlabel("Episode")
-    plt.ylabel("Reward")
-    plt.savefig(f"plots/{pretrained_model_name}_rewards_{time.time()}.png")
+    model = PPO("MlpPolicy", env, learning_rate=float(sys.argv[4]), policy_kwargs=policy_kwargs, verbose=1, device="cuda:0")
+    model.learn(total_timesteps=int(sys.argv[3]), callback=callback, progress_bar=True)
 
-    model.save("ppo_CarRacing-v0_vit")
+    # Helper from the library
+    results_plotter.plot_results(
+        [log_dir], 1e5, results_plotter.X_TIMESTEPS, "PPO CarRacing-v0"
+    )
+
+    plot_results(log_dir)
+
+    model.save(f"PPO_{sys.argv[1]}_{sys.argv[2].replace('/', '_')}_{sys.argv[3]}_{time.time()}.pth")
     env.close()
+
+    print("Finished training")
 
 
 def visualize():

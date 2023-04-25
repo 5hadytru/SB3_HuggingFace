@@ -4,8 +4,8 @@ import matplotlib.pyplot as plt
 from PIL import Image
 import gym
 from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import DummyVecEnv
-from transformers import ViTFeatureExtractor, ViTModel
+from stable_baselines3.common.vec_env import SubprocVecEnv, VecTransposeImage
+from transformers import ViTFeatureExtractor, ViTModel, AutoFeatureExtractor, ResNetForImageClassification
 import torch
 from torch import nn
 from torch.cuda.amp import autocast
@@ -15,6 +15,8 @@ from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.results_plotter import load_results, ts2xy
 from stable_baselines3.common import results_plotter
+import random
+import tqdm
 
 
 class CustomResolutionWrapper(gym.ObservationWrapper):
@@ -50,17 +52,16 @@ class SaveOnBestTrainingRewardCallback(BaseCallback):
     :param verbose: (int)
     """
 
-    def __init__(self, check_freq: int, log_dir: str, verbose=1):
+    def __init__(self, check_freq: int, log_dir: str, env_rank:int, verbose=1):
         super().__init__(verbose)
         self.check_freq = check_freq
         self.log_dir = log_dir
-        self.save_path = os.path.join(log_dir, f"best_model_PPO_{sys.argv[1]}_{sys.argv[3]}_{time.time()}.pth")
+        self.env_rank = env_rank
+        self.save_path = os.path.join(log_dir, f"PPO_{sys.argv[1]}_{sys.argv[3]}.pth")
         self.best_mean_reward = -np.inf
 
     def _init_callback(self) -> None:
-        # Create folder if needed
-        if self.save_path is not None:
-            os.makedirs(self.save_path, exist_ok=True)
+        pass
 
     def _on_step(self) -> bool:
         if self.n_calls % self.check_freq == 0:
@@ -87,35 +88,30 @@ class SaveOnBestTrainingRewardCallback(BaseCallback):
         return True
 
 
-class ViT_Policy(nn.Module):
-    def __init__(self, action_space, pretrained_model_name, device):
-        super(ViT_Policy, self).__init__()
-        self.vit = HF_ViT(pretrained_model_name, device).to(device)
+class Policy(nn.Module):
+    def __init__(self, action_space, model_constr, device):
+        super(Policy, self).__init__()
+        self.model = model_constr(device)
 
-        self.input_dim = self.vit.output_dim
+        self.input_dim = self.model.output_dim
         self.features_dim = action_space.shape[0]
 
         self.fc1 = nn.Linear(self.input_dim, 256)
         self.fc2 = nn.Linear(256, action_space.shape[0])
 
     def forward(self, obs):
-        x = self.vit(obs)
+        x = self.model(obs)
         x = nn.functional.relu(self.fc1(x))
         x = self.fc2(x)
         return x
 
 
-vit_features_dims = {
-    "google/vit-base-patch16-224": 768
-}
-
-
-class HF_ViT(nn.Module):
-    def __init__(self, pretrained_model_name, device):
-        super(HF_ViT, self).__init__()
-        self.feature_extractor = ViTFeatureExtractor.from_pretrained(pretrained_model_name)
-        self.vit_model = ViTModel.from_pretrained(pretrained_model_name)
-        self.output_dim = vit_features_dims[pretrained_model_name]
+class HF_ViT_B(nn.Module):
+    def __init__(self, device):
+        super(HF_ViT_B, self).__init__()
+        self.feature_extractor = ViTFeatureExtractor.from_pretrained("google/vit-base-patch16-224-in21k")
+        self.vit_model = ViTModel.from_pretrained("google/vit-base-patch16-224-in21k")
+        self.output_dim = 768
         self.device = device
     
         for param in self.vit_model.parameters():
@@ -125,6 +121,44 @@ class HF_ViT(nn.Module):
         images = images.squeeze().cpu()
         pixel_values = self.feature_extractor(images, return_tensors="pt")["pixel_values"].to(self.device)
         outputs = self.vit_model(pixel_values)
+
+        return outputs.last_hidden_state[:, 0].squeeze()
+
+
+class HF_RN18(nn.Module):
+    def __init__(self, device):
+        super(HF_RN18, self).__init__()
+        self.feature_extractor = AutoFeatureExtractor.from_pretrained("microsoft/resnet-18")
+        self.resnet = ResNetForImageClassification.from_pretrained("microsoft/resnet-18")
+        self.output_dim = None
+        self.device = device
+    
+        for param in self.resnet.parameters():
+            param.requires_grad = False
+
+    def forward(self, images):
+        images = images.squeeze().cpu()
+        pixel_values = self.feature_extractor(images, return_tensors="pt")["pixel_values"].to(self.device)
+        outputs = self.resnet(pixel_values)
+
+        return outputs.last_hidden_state[:, 0].squeeze()
+
+
+class HF_RN50(nn.Module):
+    def __init__(self, device):
+        super(HF_RN50, self).__init__()
+        self.feature_extractor = AutoFeatureExtractor.from_pretrained("microsoft/resnet-50")
+        self.resnet = ResNetForImageClassification.from_pretrained("microsoft/resnet-50")
+        self.output_dim = None
+        self.device = device
+    
+        for param in self.resnet.parameters():
+            param.requires_grad = False
+
+    def forward(self, images):
+        images = images.squeeze().cpu()
+        pixel_values = self.feature_extractor(images, return_tensors="pt")["pixel_values"].to(self.device)
+        outputs = self.resnet(pixel_values)
 
         return outputs.last_hidden_state[:, 0].squeeze()
 
@@ -161,14 +195,56 @@ def plot_results(log_folder, title="Learning Curve"):
     plt.savefig(f"PPO_{sys.argv[1]}_{sys.argv[2]}_{sys.argv[3]}_{time.time()}.png".replace("/", "_"))
 
 
-def run_training():
-    env_name = sys.argv[1]
-    env = gym.make(env_name)
-    env = CustomResolutionWrapper(env, resolution=(224, 224))
-    #env = DummyVecEnv([lambda: env])
+class ProgressBarCallback(BaseCallback):
+    def __init__(self, total_timesteps, verbose=1):
+        super().__init__(verbose)
+        self.total_timesteps = total_timesteps
+        self.progress_bar = None
 
-    log_dir = "logs"
-    env = Monitor(env, log_dir, filename=f"monitor_{time.time()}")
+    def _init_callback(self):
+        if self.verbose > 0:
+            self.progress_bar = tqdm.tqdm(total=self.total_timesteps, desc="Training progress")
+
+    def _on_step(self):
+        if self.progress_bar is not None:
+            self.progress_bar.update(1)
+        return True
+
+    def _on_training_end(self):
+        if self.progress_bar is not None:
+            self.progress_bar.close()
+
+
+
+def make_env(env_id, log_dir, rank, seed=0):
+    def _init():
+        env = gym.make(env_id)
+        env = CustomResolutionWrapper(env, resolution=(224, 224))
+        env.seed(seed + rank)
+        monitor_file_prefix = os.path.join(log_dir, str(rank))
+        env = Monitor(env, monitor_file_prefix)
+        return env
+    return _init
+
+model_index = {
+    "resnet-18": HF_RN18,
+    "resnet-50": HF_RN50,
+    "vit-b": HF_ViT_B
+}
+
+def run_training():
+    num_envs = 8
+    run_id = int(time.time())
+    log_dir = f"logs/run_{run_id}/"
+
+    os.mkdir(log_dir)
+    for i in range(num_envs):
+        os.mkdir(log_dir + f"{i}")
+
+    env_name = sys.argv[1]
+    envs = [make_env(env_name, log_dir, i) for i in range(num_envs)]
+    env = SubprocVecEnv(envs)
+    env = VecTransposeImage(env)
 
     device = torch.device("cuda:0")
 
@@ -181,21 +257,24 @@ def run_training():
                 vf=[224, 256, 1]
             )
         ],
-        features_extractor_class=ViT_Policy,
-        features_extractor_kwargs=dict(pretrained_model_name=pretrained_model_name, device=device),
+        features_extractor_class=Policy,
+        features_extractor_kwargs=dict(model_constr=model_index[pretrained_model_name], device=device),
     )
-
-    callback = SaveOnBestTrainingRewardCallback(check_freq=1000, log_dir=log_dir)
 
     model = PPO("MlpPolicy", env, learning_rate=float(sys.argv[4]), policy_kwargs=policy_kwargs, verbose=1, device="cuda:0")
-    model.learn(total_timesteps=int(sys.argv[3]), callback=callback, progress_bar=True)
+
+    callbacks = [SaveOnBestTrainingRewardCallback(check_freq=1000, log_dir=log_dir + f"/{i}", env_rank=i) for i in range(num_envs)]
+    callbacks.extend([ProgressBarCallback(int(sys.argv[3]))])
+
+    model.learn(total_timesteps=int(sys.argv[3]), callback=callbacks)
 
     # Helper from the library
-    results_plotter.plot_results(
-        [log_dir], 1e5, results_plotter.X_TIMESTEPS, "PPO CarRacing-v0"
-    )
-
-    plot_results(log_dir)
+    for i in range(num_envs):
+        env_log_dir = f"{log_dir}/{i}"
+        results_plotter.plot_results(
+            [env_log_dir], int(sys.argv[3]), results_plotter.X_TIMESTEPS, "PPO CarRacing-v0"
+        )
+        plot_results(env_log_dir)
 
     model.save(f"PPO_{sys.argv[1]}_{sys.argv[2].replace('/', '_')}_{sys.argv[3]}_{time.time()}.pth")
     env.close()

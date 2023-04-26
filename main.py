@@ -129,8 +129,8 @@ class HF_RN18(nn.Module):
     def __init__(self, device):
         super(HF_RN18, self).__init__()
         self.feature_extractor = AutoFeatureExtractor.from_pretrained("microsoft/resnet-18")
-        self.resnet = ResNetForImageClassification.from_pretrained("microsoft/resnet-18")
-        self.output_dim = None
+        self.resnet = ResNetForImageClassification.from_pretrained("microsoft/resnet-18").resnet
+        self.output_dim = 512
         self.device = device
     
         for param in self.resnet.parameters():
@@ -139,17 +139,17 @@ class HF_RN18(nn.Module):
     def forward(self, images):
         images = images.squeeze().cpu()
         pixel_values = self.feature_extractor(images, return_tensors="pt")["pixel_values"].to(self.device)
-        outputs = self.resnet(pixel_values)
+        outputs = self.resnet(pixel_values)["pooler_output"]
 
-        return outputs.last_hidden_state[:, 0].squeeze()
+        return outputs.squeeze()
 
 
 class HF_RN50(nn.Module):
     def __init__(self, device):
         super(HF_RN50, self).__init__()
         self.feature_extractor = AutoFeatureExtractor.from_pretrained("microsoft/resnet-50")
-        self.resnet = ResNetForImageClassification.from_pretrained("microsoft/resnet-50")
-        self.output_dim = None
+        self.resnet = ResNetForImageClassification.from_pretrained("microsoft/resnet-50").resnet
+        self.output_dim = 2048
         self.device = device
     
         for param in self.resnet.parameters():
@@ -158,9 +158,9 @@ class HF_RN50(nn.Module):
     def forward(self, images):
         images = images.squeeze().cpu()
         pixel_values = self.feature_extractor(images, return_tensors="pt")["pixel_values"].to(self.device)
-        outputs = self.resnet(pixel_values)
+        outputs = self.resnet(pixel_values)["pooler_output"]
 
-        return outputs.last_hidden_state[:, 0].squeeze()
+        return outputs.squeeze()
 
 
 def moving_average(values, window):
@@ -219,7 +219,7 @@ class ProgressBarCallback(BaseCallback):
 def make_env(env_id, log_dir, rank, seed=0):
     def _init():
         env = gym.make(env_id)
-        env = CustomResolutionWrapper(env, resolution=(224, 224))
+        #env = CustomResolutionWrapper(env, resolution=(224, 224))
         env.seed(seed + rank)
         monitor_file_prefix = os.path.join(log_dir, str(rank))
         env = Monitor(env, monitor_file_prefix)
@@ -233,7 +233,7 @@ model_index = {
 }
 
 def run_training():
-    num_envs = 8
+    num_envs = 4
     run_id = int(time.time())
     log_dir = f"logs/run_{run_id}/"
 

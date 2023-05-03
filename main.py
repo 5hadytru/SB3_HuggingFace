@@ -253,15 +253,21 @@ def run_training():
     policy_kwargs = dict(
         net_arch=[
             dict(
-                pi=[224, 256, 3],
-                vf=[224, 256, 1]
+                pi=[256],
+                vf=[256]
             )
         ],
-        features_extractor_class=Policy,
-        features_extractor_kwargs=dict(model_constr=model_index[pretrained_model_name], device=device),
+        # features_extractor_class=Policy,
+        # features_extractor_kwargs=dict(model_constr=model_index[pretrained_model_name], device=device),
     )
 
-    model = PPO("MlpPolicy", env, learning_rate=float(sys.argv[4]), policy_kwargs=policy_kwargs, verbose=1, device="cuda:0")
+    model = PPO(
+        "CnnPolicy", 
+        env, 
+        learning_rate=float(sys.argv[4]), 
+        #policy_kwargs=policy_kwargs, 
+        verbose=1, 
+        device="cuda:0")
 
     callbacks = [SaveOnBestTrainingRewardCallback(check_freq=1000, log_dir=log_dir + f"/{i}", env_rank=i) for i in range(num_envs)]
     callbacks.extend([ProgressBarCallback(int(sys.argv[3]))])

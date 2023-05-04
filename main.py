@@ -20,28 +20,6 @@ import random
 import tqdm
 
 
-class CustomResolutionWrapper(gym.ObservationWrapper):
-    def __init__(self, env, resolution=(224, 224)):
-        super().__init__(env)
-        self.resolution = resolution
-        self.observation_space = gym.spaces.Box(low=0, high=255, shape=(resolution[1], resolution[0], 3), dtype=np.uint8)
-
-    def observation(self, obs):
-        def process_image(img):
-            img_resized = cv2.resize(img, self.resolution, interpolation=cv2.INTER_AREA)
-            img_normed = img_resized.astype(np.float32)
-            return img_normed
-        
-        #print(obs.shape, np.min(obs), np.max(obs), obs.dtype)
-
-        # Remove np.apply_along_axis
-        processed_image = process_image(obs)
-
-        #print(processed_image.shape)
-
-        return processed_image
-
-
 class SaveOnBestTrainingRewardCallback(BaseCallback):
     """
     Callback for saving a model (the check is done every ``check_freq`` steps)
@@ -90,9 +68,9 @@ class SaveOnBestTrainingRewardCallback(BaseCallback):
 
 
 class Policy(nn.Module):
-    def __init__(self, action_space, model_constr, device):
+    def __init__(self, action_space, model_constr, device, n_stack, num_envs):
         super(Policy, self).__init__()
-        self.model = model_constr(device)
+        self.model = model_constr(device, n_stack, num_envs)
 
         self.input_dim = self.model.output_dim
         self.features_dim = action_space.shape[0]
@@ -107,61 +85,44 @@ class Policy(nn.Module):
         return x
 
 
-class HF_ViT_B(nn.Module):
-    def __init__(self, device):
-        super(HF_ViT_B, self).__init__()
-        self.feature_extractor = ViTFeatureExtractor.from_pretrained("google/vit-base-patch16-224-in21k")
-        self.vit_model = ViTModel.from_pretrained("google/vit-base-patch16-224-in21k")
-        self.output_dim = 768
-        self.device = device
-    
-        for param in self.vit_model.parameters():
-            param.requires_grad = False
-
-    def forward(self, images):
-        images = images.squeeze().cpu()
-        pixel_values = self.feature_extractor(images, return_tensors="pt")["pixel_values"].to(self.device)
-        outputs = self.vit_model(pixel_values)
-
-        return outputs.last_hidden_state[:, 0].squeeze()
-
-
 class HF_RN18(nn.Module):
-    def __init__(self, device):
+    def __init__(self, device, n_stack, num_envs):
         super(HF_RN18, self).__init__()
         self.feature_extractor = AutoFeatureExtractor.from_pretrained("microsoft/resnet-18")
         self.resnet = ResNetForImageClassification.from_pretrained("microsoft/resnet-18").resnet
-        self.output_dim = 512
+        self.output_dim = 512 * n_stack
         self.device = device
+        self.n_envs = num_envs
+        self.n_stack = n_stack
     
         for param in self.resnet.parameters():
             param.requires_grad = False
 
     def forward(self, images):
-        images = images.squeeze().cpu()
-        pixel_values = self.feature_extractor(images, return_tensors="pt")["pixel_values"].to(self.device)
-        outputs = self.resnet(pixel_values)["pooler_output"]
+        # images are currently (n_envs, n_stack, height, width)
 
-        return outputs.squeeze()
+        # Initialize a list to store the output feature vectors
+        outputs_list = []
 
+        # Process each environment's stacked images separately
+        for img_stack in images:
+            # Process each grayscale frame separately and store the output feature vectors
+            frame_outputs = []
+            for i in range(self.n_stack):
+                frame = torch.stack([img_stack[i], img_stack[i], img_stack[i]], dim=0).cpu()
+                pixel_values = self.feature_extractor(frame, return_tensors="pt")["pixel_values"].to(self.device)
+                output = self.resnet(pixel_values)["pooler_output"]
+                frame_outputs.append(output.squeeze())
 
-class HF_RN50(nn.Module):
-    def __init__(self, device):
-        super(HF_RN50, self).__init__()
-        self.feature_extractor = AutoFeatureExtractor.from_pretrained("microsoft/resnet-50")
-        self.resnet = ResNetForImageClassification.from_pretrained("microsoft/resnet-50").resnet
-        self.output_dim = 2048
-        self.device = device
-    
-        for param in self.resnet.parameters():
-            param.requires_grad = False
+            # Combine the output feature vectors for the frames (e.g., by concatenation or averaging)
+            combined_output = torch.cat(frame_outputs, dim=0)
+            outputs_list.append(combined_output)
 
-    def forward(self, images):
-        images = images.squeeze().cpu()
-        pixel_values = self.feature_extractor(images, return_tensors="pt")["pixel_values"].to(self.device)
-        outputs = self.resnet(pixel_values)["pooler_output"]
+        # Concatenate the output feature vectors along the batch dimension
+        outputs = torch.stack(outputs_list, dim=0)
 
-        return outputs.squeeze()
+        return outputs
+
 
 
 def moving_average(values, window):
@@ -192,7 +153,9 @@ def plot_results(log_folder, title="Reward over time (moving average)"):
     plt.xlabel("Number of Timesteps")
     plt.ylabel("Rewards")
     plt.title(title)
-    plt.savefig(f"PPO_{sys.argv[1]}_{sys.argv[2]}_{sys.argv[3]}_{time.time()}.png".replace("/", "_"))
+    fig_pth = f"PPO_{sys.argv[1]}_{sys.argv[2]}_{sys.argv[3]}_{time.time()}.png".replace("/", "_")
+    print("Fig path", fig_pth)
+    plt.savefig(fig_pth)
 
 
 class ProgressBarCallback(BaseCallback):
@@ -216,28 +179,27 @@ class ProgressBarCallback(BaseCallback):
 
 
 
-def make_env(env_id, log_dir, num_envs, seed=0):
+def make_env(env_id, log_dir, num_envs, n_stack, seed=0):
     env = make_atari_env(lambda: gym.make(env_id), n_envs=num_envs, seed=seed, monitor_dir=log_dir)
-    env = VecFrameStack(env, n_stack=num_envs)
+    env = VecFrameStack(env, n_stack=n_stack)
     return env
 
 model_index = {
-    "resnet-18": HF_RN18,
-    "resnet-50": HF_RN50,
-    "vit-b": HF_ViT_B
+    "resnet-18": HF_RN18
 }
 
 def run_training():
     run_id = int(time.time())
     log_dir = f"logs/run_{run_id}/"
     num_envs = 4
+    n_stack = 3
 
     os.mkdir(log_dir)
     for i in range(num_envs):
         os.mkdir(log_dir + f"{i}")
 
     env_name = sys.argv[1]
-    env = make_env(env_name, log_dir, num_envs)
+    env = make_env(env_name, log_dir, num_envs, n_stack)
 
     device = torch.device("cuda:0")
 
@@ -250,8 +212,12 @@ def run_training():
                 vf=[256]
             )
         ],
-        #features_extractor_class=Policy,
-        #features_extractor_kwargs=dict(model_constr=model_index[pretrained_model_name], device=device)
+        features_extractor_class=Policy,
+        features_extractor_kwargs=dict(
+            model_constr=model_index[pretrained_model_name], 
+            device=device, 
+            n_stack=n_stack,
+            num_envs=num_envs)
     )
 
     model = PPO(

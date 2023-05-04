@@ -4,7 +4,8 @@ import matplotlib.pyplot as plt
 from PIL import Image
 import gym
 from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import SubprocVecEnv, VecTransposeImage
+from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecTransposeImage, VecFrameStack
+from stable_baselines3.common.env_util import make_atari_env
 from transformers import ViTFeatureExtractor, ViTModel, AutoFeatureExtractor, ResNetForImageClassification
 import torch
 from torch import nn
@@ -174,7 +175,7 @@ def moving_average(values, window):
     return np.convolve(values, weights, "valid")
 
 
-def plot_results(log_folder, title="Learning Curve"):
+def plot_results(log_folder, title="Reward over time (moving average)"):
     """
     plot the results
 
@@ -190,8 +191,7 @@ def plot_results(log_folder, title="Learning Curve"):
     plt.plot(x, y)
     plt.xlabel("Number of Timesteps")
     plt.ylabel("Rewards")
-    plt.title(title + " Smoothed")
-    plt.show()
+    plt.title(title)
     plt.savefig(f"PPO_{sys.argv[1]}_{sys.argv[2]}_{sys.argv[3]}_{time.time()}.png".replace("/", "_"))
 
 
@@ -216,15 +216,10 @@ class ProgressBarCallback(BaseCallback):
 
 
 
-def make_env(env_id, log_dir, rank, seed=0):
-    def _init():
-        env = gym.make(env_id)
-        #env = CustomResolutionWrapper(env, resolution=(224, 224))
-        env.seed(seed + rank)
-        monitor_file_prefix = os.path.join(log_dir, str(rank))
-        env = Monitor(env, monitor_file_prefix)
-        return env
-    return _init
+def make_env(env_id, log_dir, num_envs, seed=0):
+    env = make_atari_env(lambda: gym.make(env_id), n_envs=num_envs, seed=seed, monitor_dir=log_dir)
+    env = VecFrameStack(env, n_stack=num_envs)
+    return env
 
 model_index = {
     "resnet-18": HF_RN18,
@@ -233,18 +228,16 @@ model_index = {
 }
 
 def run_training():
-    num_envs = 4
     run_id = int(time.time())
     log_dir = f"logs/run_{run_id}/"
+    num_envs = 4
 
     os.mkdir(log_dir)
     for i in range(num_envs):
         os.mkdir(log_dir + f"{i}")
 
     env_name = sys.argv[1]
-    envs = [make_env(env_name, log_dir, i) for i in range(num_envs)]
-    env = SubprocVecEnv(envs)
-    env = VecTransposeImage(env)
+    env = make_env(env_name, log_dir, num_envs)
 
     device = torch.device("cuda:0")
 
@@ -257,17 +250,18 @@ def run_training():
                 vf=[256]
             )
         ],
-        # features_extractor_class=Policy,
-        # features_extractor_kwargs=dict(model_constr=model_index[pretrained_model_name], device=device),
+        #features_extractor_class=Policy,
+        #features_extractor_kwargs=dict(model_constr=model_index[pretrained_model_name], device=device)
     )
 
     model = PPO(
         "CnnPolicy", 
         env, 
         learning_rate=float(sys.argv[4]), 
-        #policy_kwargs=policy_kwargs, 
+        policy_kwargs=policy_kwargs, 
         verbose=1, 
-        device="cuda:0")
+        device="cuda:0"
+    )
 
     callbacks = [SaveOnBestTrainingRewardCallback(check_freq=1000, log_dir=log_dir + f"/{i}", env_rank=i) for i in range(num_envs)]
     callbacks.extend([ProgressBarCallback(int(sys.argv[3]))])
